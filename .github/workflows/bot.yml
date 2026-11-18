@@ -13,6 +13,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   poll:
@@ -43,10 +44,23 @@ jobs:
         run: |
           git config user.name "tg-message-bot"
           git config user.email "tg-message-bot@users.noreply.github.com"
-          if [ -f data/owner.txt ]; then
-            git add data/owner.txt
+          if [ -f data/owner.txt ] || [ -f data/bizmap.json ]; then
+            git add data/owner.txt data/bizmap.json 2>/dev/null || true
             if ! git diff --cached --quiet; then
-              git commit -m "bind owner $(date -u +%FT%TZ)"
+              git commit -m "state $(date -u +%FT%TZ)"
               git push || (git pull --rebase --autostash && git push)
             fi
           fi
+
+      # 关键：本轮结束立刻排下一轮，形成近乎不间断的轮询链，不依赖 GitHub cron
+      - name: Chain next run
+        if: always()
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/bot.yml/dispatches" \
+            -d '{"ref":"main"}')
+          echo "next run dispatch: $code"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
