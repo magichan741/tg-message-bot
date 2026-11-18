@@ -5,6 +5,11 @@ on:
     # 每 5 分钟拉起一轮（GitHub 免费额度最小粒度，实际可能排队延迟几分钟）
     - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      run_seconds:
+        description: "单轮轮询秒数（默认 270）"
+        required: false
+        default: "270"
 
 # 同一时间只允许一轮在跑，避免两条流水线抢 getUpdates 导致重复转发
 concurrency:
@@ -36,20 +41,22 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TARGET_CHAT_ID: ${{ secrets.TARGET_CHAT_ID }}
-          RUN_SECONDS: "270"
+          RUN_SECONDS: ${{ github.event.inputs.run_seconds || '270' }}
           ACK: "0"
         run: python3 poll_bot.py
 
-      - name: Persist owner binding
+      - name: Persist state
         run: |
           git config user.name "tg-message-bot"
           git config user.email "tg-message-bot@users.noreply.github.com"
-          if [ -f data/owner.txt ] || [ -f data/bizmap.json ]; then
-            git add data/owner.txt data/bizmap.json 2>/dev/null || true
-            if ! git diff --cached --quiet; then
-              git commit -m "state $(date -u +%FT%TZ)"
-              git push || (git pull --rebase --autostash && git push)
-            fi
+          ls -l data 2>/dev/null || echo "no data dir"
+          git add -A data 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "state $(date -u +%FT%TZ)"
+            git push || (git pull --rebase --autostash && git push)
+            echo "state committed"
+          else
+            echo "no state change"
           fi
 
       # 关键：本轮结束立刻排下一轮，形成近乎不间断的轮询链，不依赖 GitHub cron
