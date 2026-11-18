@@ -1,0 +1,52 @@
+name: TG Message Bot
+
+on:
+  schedule:
+    # 每 5 分钟拉起一轮（GitHub 免费额度最小粒度，实际可能排队延迟几分钟）
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+# 同一时间只允许一轮在跑，避免两条流水线抢 getUpdates 导致重复转发
+concurrency:
+  group: tg-message-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check secret
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          if [ -z "$BOT_TOKEN" ]; then echo "缺少 secret: BOT_TOKEN"; exit 1; fi
+
+      - name: Poll and forward
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TARGET_CHAT_ID: ${{ secrets.TARGET_CHAT_ID }}
+          RUN_SECONDS: "270"
+          ACK: "0"
+        run: python3 poll_bot.py
+
+      - name: Persist owner binding
+        run: |
+          git config user.name "tg-message-bot"
+          git config user.email "tg-message-bot@users.noreply.github.com"
+          if [ -f data/owner.txt ]; then
+            git add data/owner.txt
+            if ! git diff --cached --quiet; then
+              git commit -m "bind owner $(date -u +%FT%TZ)"
+              git push || (git pull --rebase --autostash && git push)
+            fi
+          fi
