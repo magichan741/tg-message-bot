@@ -29,6 +29,7 @@ ACK = os.environ.get("ACK", "0").strip() == "1"
 ACK_TEXT = os.environ.get("ACK_TEXT", "已收到你的留言，我会尽快查看并回复。")
 
 OWNER_FILE = os.path.join("data", "owner.txt")
+BIZ_FILE = os.path.join("data", "bizmap.json")
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
 _FAKE_CALL = None
 
@@ -76,6 +77,23 @@ def save_owner(chat_id):
     log(f"已绑定主人：{chat_id}")
 
 
+# ---- 业务连接映射：客户 chat_id -> business_connection_id ----
+def load_biz():
+    try:
+        with open(BIZ_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_biz(mapping):
+    if not mapping:
+        return
+    os.makedirs("data", exist_ok=True)
+    with open(BIZ_FILE, "w", encoding="utf-8") as f:
+        json.dump(mapping, f, ensure_ascii=False, indent=1)
+
+
 def display_name(user):
     if not user:
         return "未知用户"
@@ -120,7 +138,7 @@ MEDIA_KEYS = ("photo", "video", "video_note", "voice", "audio",
               "document", "sticker", "animation")
 
 
-def handle_message(msg, update_id):
+def handle_message(msg, update_id, biz_id=None):
     chat = msg.get("chat", {})
     chat_id = chat.get("id")
     sender = msg.get("from", {})
@@ -129,6 +147,14 @@ def handle_message(msg, update_id):
         return
 
     owner = load_owner()
+
+    # 业务会话（秘书模式）：记录 chat_id -> business_connection_id，供 /reply 使用
+    if biz_id and chat_id:
+        biz = load_biz()
+        if biz.get(str(chat_id)) != biz_id:
+            biz[str(chat_id)] = biz_id
+            save_biz(biz)
+            log(f"登记业务会话 {chat_id} -> {biz_id}")
 
     # 还没有主人：只接受 /start 认领
     if not owner:
@@ -144,6 +170,10 @@ def handle_message(msg, update_id):
             call("sendMessage", chat_id=chat_id, text="机器人尚未绑定主人，请先发送 /start 完成绑定。")
         return
 
+    # 主人在业务会话里自己打的字，不用再转给自己
+    if biz_id and str(sender.get("id")) == str(owner):
+        return
+
     # 主人指令
     if str(chat_id) == str(owner) and text.startswith("/"):
         cmd, _, rest = text.partition(" ")
@@ -152,7 +182,8 @@ def handle_message(msg, update_id):
                 "留言机器人在线。\n"
                 "/id  查看 chat id\n"
                 "/reply <chat_id> <内容>  回复留言者\n"
-                "/whoami  查看当前绑定"
+                "/whoami  查看当前绑定\n"
+                "/sessions  已登记的业务会话数"
             ))
             return
         if cmd == "/id":
@@ -161,29 +192,39 @@ def handle_message(msg, update_id):
         if cmd == "/whoami":
             call("sendMessage", chat_id=chat_id, text=f"留言接收人：{owner}")
             return
+        if cmd == "/sessions":
+            call("sendMessage", chat_id=chat_id, text=f"已登记业务会话：{len(load_biz())} 个")
+            return
         if cmd == "/reply":
             target_id, _, body = rest.partition(" ")
             if not target_id.lstrip("-").isdigit() or not body.strip():
                 call("sendMessage", chat_id=chat_id, text="用法：/reply <chat_id> <内容>")
                 return
-            r = call("sendMessage", chat_id=target_id.strip(), text=body.strip())
+            target_id = target_id.strip()
+            params = {"chat_id": target_id, "text": body.strip()}
+            biz_id_for_target = load_biz().get(target_id)
+            if biz_id_for_target:
+                params["business_connection_id"] = biz_id_for_target
+            r = call("sendMessage", **params)
+            via = "（业务会话）" if biz_id_for_target else ""
             call("sendMessage", chat_id=chat_id,
-                 text="已发送。" if r.get("ok") else f"发送失败：{r.get('error','未知')}")
+                 text=(f"已发送{via}。" if r.get("ok") else f"发送失败{via}：{r.get('error','未知')}"))
             return
 
-    # 普通留言 -> 转发存档
+    # 留言 -> 转发存档
     kind, body = extract(msg)
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(msg.get("date", int(time.time()))))
     header = (f"📩 新留言 #{update_id}\n"
               f"来自：{display_name(sender)}\n"
               f"chat_id：{chat_id}\n"
               f"时间(UTC)：{ts}\n"
-              f"类型：{kind}")
+              f"类型：{kind}"
+              + ("\n通道：业务账号（秘书模式）" if biz_id else ""))
     call("sendMessage", chat_id=owner, text=(header + ("\n\n" + body if body.strip() else ""))[:4000],
          disable_web_page_preview="true")
     if any(k in msg for k in MEDIA_KEYS):
         call("copyMessage", chat_id=owner, from_chat_id=chat_id, message_id=msg.get("message_id"))
-    if ACK and chat_id:
+    if ACK and chat_id and not biz_id:
         call("sendMessage", chat_id=chat_id, text=ACK_TEXT)
     log(f"已转发 #{update_id} 来自 {display_name(sender)}")
 
@@ -205,10 +246,12 @@ def run():
 
     deadline = time.time() + RUN_SECONDS
     offset, last_id = 0, None
+    allowed = json.dumps(["message", "channel_post",
+                          "business_connection", "business_message",
+                          "edited_business_message"])
     while time.time() < deadline:
         wait = max(1, min(30, int(deadline - time.time())))
-        r = call("getUpdates", offset=offset, timeout=wait,
-                 allowed_updates=json.dumps(["message", "channel_post"]))
+        r = call("getUpdates", offset=offset, timeout=wait, allowed_updates=allowed)
         if not r.get("ok"):
             log(f"getUpdates 失败：{r.get('error')}")
             time.sleep(3)
@@ -216,7 +259,14 @@ def run():
         for u in r.get("result") or []:
             last_id = u["update_id"]
             try:
-                handle_message(u.get("message") or u.get("channel_post") or {}, last_id)
+                if "business_connection" in u:
+                    bc = u["business_connection"]
+                    log(f"业务连接：id={bc.get('id')} user={bc.get('user',{}).get('id')} 已启用={bc.get('is_enabled')}")
+                elif u.get("business_message"):
+                    handle_message(u["business_message"], last_id,
+                                   biz_id=u["business_message"].get("business_connection_id"))
+                elif u.get("message") or u.get("channel_post"):
+                    handle_message(u.get("message") or u.get("channel_post"), last_id)
             except Exception as e:
                 log(f"处理 {last_id} 出错：{e}")
             offset = last_id + 1
